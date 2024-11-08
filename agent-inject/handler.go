@@ -9,10 +9,12 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault-k8s/agent-inject/agent"
 	"github.com/hashicorp/vault/sdk/helper/strutil"
+	"github.com/prometheus/client_golang/prometheus"
 	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -41,6 +43,8 @@ var (
 func init() {
 	utilruntime.Must(admissionv1.AddToScheme(admissionScheme))
 	utilruntime.Must(v1beta1.AddToScheme(admissionScheme))
+
+	InitMetrics(prometheus.DefaultRegisterer)
 }
 
 // Handler is the HTTP handler for admission webhooks.
@@ -84,6 +88,14 @@ type Handler struct {
 // served via an HTTP server.
 func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 	h.Log.Info("Request received", "Method", r.Method, "URL", r.URL)
+
+	// Measure request processing duration and monitor request queue
+	metrics.requestQueue.Inc()
+	requestStart := time.Now()
+	defer func() {
+		metrics.requestProcessingTime.Observe(float64(time.Since(requestStart).Milliseconds()))
+		metrics.requestQueue.Dec()
+	}()
 
 	if ct := r.Header.Get("Content-Type"); ct != "application/json" {
 		msg := fmt.Sprintf("Invalid content-type: %q", ct)
@@ -183,6 +195,7 @@ func (h *Handler) Mutate(req *admissionv1.AdmissionRequest) *admissionv1.Admissi
 
 	h.Log.Debug("checking namespaces..")
 	if strutil.StrListContains(kubeSystemNamespaces, req.Namespace) {
+		metrics.failedInjectionsByNamespace.With(prometheus.Labels{"namespace": req.Namespace}).Inc()
 		err := fmt.Errorf("error with request namespace: cannot inject into system namespaces: %s", req.Namespace)
 		return admissionError(req.UID, err)
 	}
@@ -219,6 +232,7 @@ func (h *Handler) Mutate(req *admissionv1.AdmissionRequest) *admissionv1.Admissi
 	}
 	err = agent.Init(&pod, cfg)
 	if err != nil {
+		metrics.failedInjectionsByNamespace.With(prometheus.Labels{"namespace": req.Namespace}).Inc()
 		err := fmt.Errorf("error adding default annotations: %s", err)
 		return admissionError(req.UID, err)
 	}
@@ -226,6 +240,7 @@ func (h *Handler) Mutate(req *admissionv1.AdmissionRequest) *admissionv1.Admissi
 	h.Log.Debug("creating new agent..")
 	agentSidecar, err := agent.New(&pod)
 	if err != nil {
+		metrics.failedInjectionsByNamespace.With(prometheus.Labels{"namespace": req.Namespace}).Inc()
 		err := fmt.Errorf("error creating new agent sidecar: %s", err)
 		return admissionError(req.UID, err)
 	}
@@ -234,6 +249,7 @@ func (h *Handler) Mutate(req *admissionv1.AdmissionRequest) *admissionv1.Admissi
 	h.Log.Debug("validating agent configuration..")
 	err = agentSidecar.Validate()
 	if err != nil {
+		metrics.failedInjectionsByNamespace.With(prometheus.Labels{"namespace": req.Namespace}).Inc()
 		err := fmt.Errorf("error validating agent configuration: %s", err)
 		return admissionError(req.UID, err)
 	}
@@ -241,6 +257,7 @@ func (h *Handler) Mutate(req *admissionv1.AdmissionRequest) *admissionv1.Admissi
 	h.Log.Debug("creating patches for the pod..")
 	patch, err := agentSidecar.Patch()
 	if err != nil {
+		metrics.failedInjectionsByNamespace.With(prometheus.Labels{"namespace": req.Namespace}).Inc()
 		err := fmt.Errorf("error creating patch for agent: %s", err)
 		return admissionError(req.UID, err)
 	}
@@ -248,6 +265,8 @@ func (h *Handler) Mutate(req *admissionv1.AdmissionRequest) *admissionv1.Admissi
 	resp.Patch = patch
 	patchType := admissionv1.PatchTypeJSONPatch
 	resp.PatchType = &patchType
+
+	metrics.injectionsByNamespace.With(prometheus.Labels{"namespace": req.Namespace}).Inc()
 
 	return resp
 }
